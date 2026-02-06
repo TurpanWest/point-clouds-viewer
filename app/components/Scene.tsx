@@ -21,7 +21,8 @@ export default function Scene({
 
   const { camera, gl, size } = useThree();
 
-  const pcd = useLoader(PCDLoader, '/kitti_2000w.pcd')
+  // 使用 GitHub LFS 的媒体直链 (注意：media.githubusercontent.com)
+  const pcd = useLoader(PCDLoader, 'https://media.githubusercontent.com/media/TurpanWest/point-clouds-viewer/main/public/kitti_2000w.pcd')
   const pointsRef = useRef<THREE.Points>(null)
   const [selectionBox, setSelectionBox] = useState<{ start: { x: number; y: number } | null; current: { x: number; y: number } | null }>({ start: null, current: null });
 
