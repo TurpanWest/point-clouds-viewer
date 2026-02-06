@@ -1,7 +1,8 @@
 "use client";
 
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, Stats } from "@react-three/drei";
+import { PerfMonitor } from "r3f-monitor";
+import { OrbitControls} from "@react-three/drei";
 import Experience from "./components/Experience";
 import Interface from "./components/Interface";
 import "./globals.css"; 
@@ -16,12 +17,14 @@ export default function Page() {
             fov: 60,
             near: 0.1,
             far: 2000,
-            position: [100, 100, 100],
+            up: [0, 0, 1],
+            position: [0, -50, 30],
           }}
         >
+          <axesHelper args={[25]} />
+          <PerfMonitor style={{ transform: "scale(1.5)", transformOrigin: "100% 0" }} />
           <Experience />
           <OrbitControls />
-          <Stats />
         </Canvas>
         <Interface />
     </main>
