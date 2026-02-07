@@ -10,8 +10,24 @@ interface SceneProps {
   enableSelection?: boolean;
 }
 
-const tempColor = new THREE.Color();
 const tempVec = new THREE.Vector3();
+
+function isPointInPolygon(point: {x: number, y: number}, vs: {x: number, y: number}[]) {
+    // ray-casting algorithm based on
+    // https://github.com/substack/point-in-polygon
+    var x = point.x, y = point.y;
+    var inside = false;
+    for (var i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+        var xi = vs[i].x, yi = vs[i].y;
+        var xj = vs[j].x, yj = vs[j].y;
+        var intersect = ((yi > y) != (yj > y))
+            && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+};
+
+import { useSelectionStore } from '../stores/useSelectionStore';
 
 export default function Scene({
   color = '#F6F6F6',
@@ -20,11 +36,17 @@ export default function Scene({
 }: SceneProps) {
 
   const { camera, gl, size } = useThree();
+  const setSelectionResult = useSelectionStore(state => state.setSelectionResult);
 
   // 使用 GitHub LFS 的媒体直链 (注意：media.githubusercontent.com)
   const pcd = useLoader(PCDLoader, 'https://media.githubusercontent.com/media/TurpanWest/point-clouds-viewer/main/public/kitti_2000w.pcd')
   const pointsRef = useRef<THREE.Points>(null)
-  const [selectionBox, setSelectionBox] = useState<{ start: { x: number; y: number } | null; current: { x: number; y: number } | null }>({ start: null, current: null });
+  
+  // State for rendering the lasso line
+  const [lassoPoints, setLassoPoints] = useState<{ x: number; y: number }[]>([]);
+  // Ref for logic to avoid re-binding event listeners on every move
+  const lassoPointsRef = useRef<{ x: number; y: number }[]>([]);
+  const isDragging = useRef(false);
 
 
   // Initial setup
@@ -50,23 +72,40 @@ export default function Scene({
   const handlePointerDown = useCallback((e: PointerEvent) => {
     if (!enableSelection || e.button !== 0 || !e.shiftKey) return;
     e.stopPropagation();
+    isDragging.current = true;
     const rect = gl.domElement.getBoundingClientRect();
-    setSelectionBox({ 
-      start: { x: e.clientX - rect.left, y: e.clientY - rect.top }, 
-      current: { x: e.clientX - rect.left, y: e.clientY - rect.top } 
-    });
+    const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    
+    lassoPointsRef.current = [point];
+    setLassoPoints([point]);
   }, [enableSelection, gl.domElement]);
 
   const handlePointerMove = useCallback((e: PointerEvent) => {
-    if (!selectionBox.start) return;
+    if (!isDragging.current) return;
     const rect = gl.domElement.getBoundingClientRect();
-    setSelectionBox(prev => ({ ...prev, current: { x: e.clientX - rect.left, y: e.clientY - rect.top } }));
-  }, [selectionBox.start, gl.domElement]);
+    const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    
+    lassoPointsRef.current.push(point);
+    // Create a new array reference to trigger render
+    setLassoPoints([...lassoPointsRef.current]);
+  }, [gl.domElement]);
 
   const handlePointerUp = useCallback(() => {
-    if (!selectionBox.start || !selectionBox.current || !pointsRef.current) {
-      setSelectionBox({ start: null, current: null });
-      return;
+    if (!isDragging.current || !pointsRef.current) {
+        isDragging.current = false;
+        lassoPointsRef.current = [];
+        setLassoPoints([]);
+        return;
+    }
+    isDragging.current = false;
+
+    const points = lassoPointsRef.current;
+
+    // Minimum points for a polygon
+    if (points.length < 3) {
+        lassoPointsRef.current = [];
+        setLassoPoints([]);
+        return;
     }
 
     const geometry = pointsRef.current.geometry;
@@ -74,10 +113,15 @@ export default function Scene({
     const colors = geometry.attributes.color;
     const count = positions.count;
 
-    const startX = Math.min(selectionBox.start.x, selectionBox.current.x);
-    const endX = Math.max(selectionBox.start.x, selectionBox.current.x);
-    const startY = Math.min(selectionBox.start.y, selectionBox.current.y);
-    const endY = Math.max(selectionBox.start.y, selectionBox.current.y);
+    // Calculate Bounding Box of the Lasso to optimize search
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+    }
 
     const baseThreeColor = new THREE.Color(color);
     const selThreeColor = new THREE.Color(selectedColor);
@@ -86,9 +130,10 @@ export default function Scene({
 
     let selectedCount = 0;
     
+    const startTime = performance.now();
     console.time("Selection Calculation"); // 计时开始
 
-    // 遍历所有点 (注意：2000万次循环在 JS 中非常慢，可能卡顿 1-3秒)
+    // 遍历所有点
     for (let i = 0; i < count; i++) {
       tempVec.fromBufferAttribute(positions, i); // 获取点坐标
       tempVec.project(camera); // 投影到 NDC 空间
@@ -97,22 +142,35 @@ export default function Scene({
       const sx = (tempVec.x * .5 + .5) * width;
       const sy = (-(tempVec.y * .5) + .5) * height;
 
-      if (sx >= startX && sx <= endX && sy >= startY && sy <= endY) {
+      // Optimization: First check if point is within the bounding box of the lasso
+      if (sx < minX || sx > maxX || sy < minY || sy > maxY) {
+        // Outside bbox, definitely not inside. Reset color (optional)
+        colors.setXYZ(i, baseThreeColor.r, baseThreeColor.g, baseThreeColor.b);
+        continue;
+      }
+
+      // If inside bbox, perform detailed polygon check
+      if (isPointInPolygon({x: sx, y: sy}, points)) {
         colors.setXYZ(i, selThreeColor.r, selThreeColor.g, selThreeColor.b);
         selectedCount++;
       } else {
-        // 可选：如果不希望重置未选中的点，可以注释掉下面这行
         colors.setXYZ(i, baseThreeColor.r, baseThreeColor.g, baseThreeColor.b);
       }
     }
     
     console.timeEnd("Selection Calculation"); // 计时结束
+    const endTime = performance.now();
+    const duration = endTime - startTime;
     console.log(`Selected ${selectedCount} points from ${count} total`);
 
-    colors.needsUpdate = true; // 关键：通知 GPU 更新颜色
-    setSelectionBox({ start: null, current: null });
+    setSelectionResult(selectedCount, count, duration);
 
-  }, [selectionBox, camera, size, color, selectedColor]);
+    colors.needsUpdate = true; // 关键：通知 GPU 更新颜色
+    
+    lassoPointsRef.current = [];
+    setLassoPoints([]); // Clear lasso
+
+  }, [camera, size, color, selectedColor]);
 
   useEffect(() => {
     const canvas = gl.domElement;
@@ -126,18 +184,12 @@ export default function Scene({
     };
   }, [handlePointerDown, handlePointerMove, handlePointerUp, gl.domElement]);
 
-  // 样式保持不变
-  const boxStyle: React.CSSProperties = selectionBox.start && selectionBox.current ? {
-    position: 'absolute',
-    left: Math.min(selectionBox.start.x, selectionBox.current.x),
-    top: Math.min(selectionBox.start.y, selectionBox.current.y),
-    width: Math.abs(selectionBox.current.x - selectionBox.start.x),
-    height: Math.abs(selectionBox.current.y - selectionBox.start.y),
-    border: '1px solid #fff',
-    backgroundColor: 'rgba(0, 150, 255, 0.3)',
-    pointerEvents: 'none',
-    zIndex: 10
-  } : { display: 'none' };
+  // Generate SVG path for lasso
+  const lassoPath = useMemo(() => {
+      if (lassoPoints.length === 0) return '';
+      // 移除 'Z'，保持路径开放，不自动闭合
+      return lassoPoints.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ');
+  }, [lassoPoints]);
 
   return (
     <>
@@ -153,7 +205,25 @@ export default function Scene({
       </points>
       
       <Html fullscreen style={{ pointerEvents: 'none', overflow: 'hidden' }}>
-        <div style={boxStyle} />
+        {lassoPoints.length > 0 && (
+            <svg width="100%" height="100%" style={{ position: 'absolute', top: 0, left: 0 }}>
+                {/* 
+                    根据图片要求：
+                    1. 红色虚线 (stroke="#ff3333", strokeDasharray="8,8")
+                    2. 无填充 (fill="none")
+                    3. 视觉上不闭合，直到逻辑计算时才隐式闭合
+                */}
+                <path 
+                    d={lassoPath} 
+                    stroke="#ff3333" 
+                    strokeWidth="3" 
+                    strokeDasharray="8,8" 
+                    fill="none" 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                />
+            </svg>
+        )}
       </Html>
     </>
   );
