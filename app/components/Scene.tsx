@@ -3,31 +3,14 @@ import { useThree, useLoader } from '@react-three/fiber';
 import { Html } from '@react-three/drei';
 import { PCDLoader } from 'three-stdlib';
 import * as THREE from 'three';
+import { GPUSelectionHelper } from '../utils/GPUSelectionHelper';
+import { useSelectionStore } from '../stores/useSelectionStore';
 
 interface SceneProps {
   color?: string;
   selectedColor?: string;
   enableSelection?: boolean;
 }
-
-const tempVec = new THREE.Vector3();
-
-function isPointInPolygon(point: {x: number, y: number}, vs: {x: number, y: number}[]) {
-    // ray-casting algorithm based on
-    // https://github.com/substack/point-in-polygon
-    var x = point.x, y = point.y;
-    var inside = false;
-    for (var i = 0, j = vs.length - 1; i < vs.length; j = i++) {
-        var xi = vs[i].x, yi = vs[i].y;
-        var xj = vs[j].x, yj = vs[j].y;
-        var intersect = ((yi > y) != (yj > y))
-            && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-        if (intersect) inside = !inside;
-    }
-    return inside;
-};
-
-import { useSelectionStore } from '../stores/useSelectionStore';
 
 export default function Scene({
   color = '#F6F6F6',
@@ -42,6 +25,9 @@ export default function Scene({
   const pcd = useLoader(PCDLoader, 'https://media.githubusercontent.com/media/TurpanWest/point-clouds-viewer/main/public/kitti_2000w.pcd')
   const pointsRef = useRef<THREE.Points>(null)
   
+  // GPU Selection Helper
+  const gpuHelper = useRef<GPUSelectionHelper | null>(null);
+
   // State for rendering the lasso line
   const [lassoPoints, setLassoPoints] = useState<{ x: number; y: number }[]>([]);
   // Ref for logic to avoid re-binding event listeners on every move
@@ -65,8 +51,22 @@ export default function Scene({
         }
         pcd.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       }
+      
+      // Initialize GPU Helper
+      if (!gpuHelper.current) {
+        gpuHelper.current = new GPUSelectionHelper(gl);
+      }
+      gpuHelper.current.initPoints(pcd.geometry.attributes.position as THREE.BufferAttribute);
     }
-  }, [pcd, color]);
+    
+    // Cleanup
+    return () => {
+        if (gpuHelper.current) {
+            gpuHelper.current.dispose();
+            gpuHelper.current = null;
+        }
+    }
+  }, [pcd, color, gl]);
 
   // Selection Logic
   const handlePointerDown = useCallback((e: PointerEvent) => {
@@ -91,7 +91,7 @@ export default function Scene({
   }, [gl.domElement]);
 
   const handlePointerUp = useCallback(() => {
-    if (!isDragging.current || !pointsRef.current) {
+    if (!isDragging.current || !pointsRef.current || !gpuHelper.current) {
         isDragging.current = false;
         lassoPointsRef.current = [];
         setLassoPoints([]);
@@ -109,56 +109,37 @@ export default function Scene({
     }
 
     const geometry = pointsRef.current.geometry;
-    const positions = geometry.attributes.position;
     const colors = geometry.attributes.color;
-    const count = positions.count;
-
-    // Calculate Bounding Box of the Lasso to optimize search
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (let i = 0; i < points.length; i++) {
-        const p = points[i];
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-    }
+    const count = geometry.attributes.position.count;
 
     const baseThreeColor = new THREE.Color(color);
     const selThreeColor = new THREE.Color(selectedColor);
-    const width = size.width;
-    const height = size.height;
+    
+    const startTime = performance.now();
+    console.time("GPU Selection"); // 计时开始
+
+    // --- GPU Calculation Start ---
+    const buffer = gpuHelper.current.compute(camera, points, size.width, size.height);
+    // --- GPU Calculation End ---
 
     let selectedCount = 0;
     
-    const startTime = performance.now();
-    console.time("Selection Calculation"); // 计时开始
-
-    // 遍历所有点
-    for (let i = 0; i < count; i++) {
-      tempVec.fromBufferAttribute(positions, i); // 获取点坐标
-      tempVec.project(camera); // 投影到 NDC 空间
-
-      // 转换 NDC 到屏幕坐标
-      const sx = (tempVec.x * .5 + .5) * width;
-      const sy = (-(tempVec.y * .5) + .5) * height;
-
-      // Optimization: First check if point is within the bounding box of the lasso
-      if (sx < minX || sx > maxX || sy < minY || sy > maxY) {
-        // Outside bbox, definitely not inside. Reset color (optional)
-        colors.setXYZ(i, baseThreeColor.r, baseThreeColor.g, baseThreeColor.b);
-        continue;
-      }
-
-      // If inside bbox, perform detailed polygon check
-      if (isPointInPolygon({x: sx, y: sy}, points)) {
-        colors.setXYZ(i, selThreeColor.r, selThreeColor.g, selThreeColor.b);
-        selectedCount++;
-      } else {
-        colors.setXYZ(i, baseThreeColor.r, baseThreeColor.g, baseThreeColor.b);
-      }
+    if (buffer) {
+        // Readback buffer is RGBA. Red channel > 0 means selected.
+        for (let i = 0; i < count; i++) {
+            // Buffer size is textureSize * textureSize * 4
+            // pointIndex i maps to pixel i.
+            // But texture might be larger than count. Check bound.
+            if (buffer[i * 4] > 128) { // Threshold 0.5 (128/255)
+                colors.setXYZ(i, selThreeColor.r, selThreeColor.g, selThreeColor.b);
+                selectedCount++;
+            } else {
+                colors.setXYZ(i, baseThreeColor.r, baseThreeColor.g, baseThreeColor.b);
+            }
+        }
     }
     
-    console.timeEnd("Selection Calculation"); // 计时结束
+    console.timeEnd("GPU Selection"); // 计时结束
     const endTime = performance.now();
     const duration = endTime - startTime;
     console.log(`Selected ${selectedCount} points from ${count} total`);
@@ -221,6 +202,7 @@ export default function Scene({
                     fill="none" 
                     strokeLinecap="round" 
                     strokeLinejoin="round" 
+                    fillRule="evenodd"
                 />
             </svg>
         )}

@@ -24,7 +24,7 @@ export default function Page() {
           <axesHelper args={[25]} />
           <PerfMonitor style={{ transform: "scale(1.5)", transformOrigin: "100% 0" }} />
           <Experience />
-          <OrbitControls />
+          <OrbitControls enablePan={false}/>
         </Canvas>
         <Interface />
     </main>
